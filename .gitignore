@@ -1,0 +1,10 @@
+/target
+/app/dist
+/app/node_modules
+/src-tauri/gen
+/src-tauri/target
+/src-tauri/binaries/
+
+.gstack/
+.superpowers/
+.DS_Store

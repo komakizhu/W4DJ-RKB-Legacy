@@ -1,0 +1,21 @@
+[package]
+name = "w4dj-rkb-legacy"
+version = "2.0.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.39", features = ["derive"] }
+toml = "0.8.22"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+walkdir = "2.5.0"
+indicatif = "0.17.11"
+rayon = "1.10.0"
+text-to-ascii-art = "0.1.10"
+which = "8.0.0"
+metaflac = "0.2.8"
+id3 = "1.16.3"
+anyhow = "1.0.98"
+
+[dev-dependencies]
+tempfile = "3.10.1"

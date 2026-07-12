@@ -1,0 +1,17 @@
+[package]
+name = "w4dj-rkb-legacy-desktop"
+version = "2.0.0"
+edition = "2024"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tauri = { version = "2", features = ["macos-private-api"] }
+window-vibrancy = "0.6.0"
+w4dj-rkb-legacy = { package = "w4dj-rkb-legacy", path = ".." }
+tauri-plugin-dialog = "2.7.1"
+libc = "0.2"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }

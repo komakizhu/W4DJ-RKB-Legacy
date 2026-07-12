@@ -1,0 +1,1393 @@
+use crate::config::{LosslessFormat, Mode};
+use crate::metadata::build_id3_tag_from_flac;
+use crate::task::{TaskController, TaskSnapshot};
+use id3::{TagLike, Version};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io::{self, Error, ErrorKind};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputPolicy {
+    pub output_extension: &'static str,
+    pub target_profile: TargetProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetProfile {
+    CompatMp3,
+    LosslessWav,
+    LosslessAiff,
+}
+
+impl TargetProfile {
+    fn output_extension(self) -> &'static str {
+        match self {
+            TargetProfile::CompatMp3 => "mp3",
+            TargetProfile::LosslessWav => "wav",
+            TargetProfile::LosslessAiff => "aiff",
+        }
+    }
+}
+
+pub fn resolve_output_policy(
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    source_extension: &str,
+) -> OutputPolicy {
+    let source_extension = source_extension.trim().to_lowercase();
+
+    match mode {
+        Mode::Compat => OutputPolicy {
+            output_extension: "mp3",
+            target_profile: TargetProfile::CompatMp3,
+        },
+        Mode::Lossless if source_extension == "mp3" => OutputPolicy {
+            output_extension: "mp3",
+            target_profile: TargetProfile::CompatMp3,
+        },
+        Mode::Lossless => {
+            let target_profile = match lossless_format.unwrap_or(LosslessFormat::Wav) {
+                LosslessFormat::Wav => TargetProfile::LosslessWav,
+                LosslessFormat::Aiff => TargetProfile::LosslessAiff,
+            };
+
+            OutputPolicy {
+                output_extension: target_profile.output_extension(),
+                target_profile,
+            }
+        }
+    }
+}
+
+pub fn find_ffmpeg() -> Option<String> {
+    if let Ok(explicit_path) = env::var("W4DJ_FFMPEG_PATH") {
+        let candidate = PathBuf::from(explicit_path);
+        if is_usable_ffmpeg_candidate(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
+    if let Ok(exe_dir) = env::current_exe()
+        && let Some(found) = find_ffmpeg_next_to_exe(&exe_dir)
+    {
+        return Some(found.to_string_lossy().into_owned());
+    }
+
+    if let Ok(path) = which::which("ffmpeg") {
+        return Some(path.to_string_lossy().into_owned());
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(path) = which::which("ffmpeg.exe") {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+
+    None
+}
+
+fn find_ffmpeg_next_to_exe(exe_path: &Path) -> Option<PathBuf> {
+    let exe_dir = exe_path.parent()?;
+    let search_dirs = [exe_dir.to_path_buf(), exe_dir.join("binaries")];
+
+    for candidate_name in preferred_ffmpeg_candidate_names() {
+        for dir in &search_dirs {
+            let candidate = dir.join(candidate_name);
+            if is_usable_ffmpeg_candidate(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for dir in search_dirs {
+        if let Some(found) = find_ffmpeg_sidecar_in_dir(&dir) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn find_ffmpeg_sidecar_in_dir(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ffmpeg = entry
+            .file_name()
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with("ffmpeg");
+
+        if !is_ffmpeg {
+            continue;
+        }
+
+        if !is_usable_ffmpeg_candidate(&path) {
+            continue;
+        }
+
+        return Some(path);
+    }
+
+    None
+}
+
+fn is_usable_ffmpeg_candidate(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+
+    if !metadata.is_file() || metadata.len() == 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        true
+    }
+}
+
+fn preferred_ffmpeg_candidate_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        return match std::env::consts::ARCH {
+            "x86_64" => &["ffmpeg-x86_64-pc-windows-msvc.exe", "ffmpeg.exe", "ffmpeg"],
+            "aarch64" => &["ffmpeg-aarch64-pc-windows-msvc.exe", "ffmpeg.exe", "ffmpeg"],
+            _ => &["ffmpeg.exe", "ffmpeg"],
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match std::env::consts::ARCH {
+            "aarch64" => &["ffmpeg-aarch64-apple-darwin", "ffmpeg"],
+            "x86_64" => &["ffmpeg-x86_64-apple-darwin", "ffmpeg"],
+            _ => &["ffmpeg"],
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        &["ffmpeg"]
+    }
+}
+
+pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
+    collect_music_dict(folder, &["mp3", "flac", "wav", "aiff"])
+}
+
+pub fn get_destination_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
+    collect_music_dict(folder, &["mp3", "wav", "aiff"])
+}
+
+pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Ok(());
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_temporary_artifact(&path) {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_music_dict(
+    folder: &str,
+    allowed_extensions: &[&str],
+) -> HashMap<String, (String, PathBuf)> {
+    let mut music_dict = HashMap::new();
+
+    for entry in walkdir::WalkDir::new(folder)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && !is_temporary_artifact(entry.path())
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext_str| {
+                        let lower = ext_str.to_lowercase();
+                        allowed_extensions.iter().any(|allowed| *allowed == lower)
+                    })
+        })
+    {
+        let path = entry.path().to_path_buf();
+        let song_name = derive_song_name(entry.path());
+        let size = entry
+            .metadata()
+            .map(|m| m.len().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        let should_replace = music_dict
+            .get(&song_name)
+            .map(|existing| should_prefer_file(&path, &size, existing))
+            .unwrap_or(true);
+
+        if should_replace {
+            music_dict.insert(song_name, (size, path));
+        }
+    }
+
+    music_dict
+}
+
+fn is_temporary_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".w4dj-"))
+}
+
+fn should_prefer_file(
+    candidate_path: &Path,
+    candidate_size: &str,
+    current: &(String, PathBuf),
+) -> bool {
+    let candidate_rank = file_rank(candidate_path);
+    let current_rank = file_rank(&current.1);
+
+    candidate_rank > current_rank
+        || (candidate_rank == current_rank
+            && candidate_size.parse::<u64>().unwrap_or(0) >= current.0.parse::<u64>().unwrap_or(0))
+}
+
+fn file_rank(path: &Path) -> u8 {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .as_deref()
+    {
+        Some("wav") | Some("aiff") => 4,
+        Some("flac") => 3,
+        Some("mp3") => 1,
+        _ => 0,
+    }
+}
+
+pub fn compare_music_dicts<'a>(
+    wf_dict: &'a HashMap<String, (String, PathBuf)>,
+    sf_dict: &'a HashMap<String, (String, PathBuf)>,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+) -> HashMap<&'a String, &'a (String, PathBuf)> {
+    wf_dict
+        .iter()
+        .filter(|(name, wf_info)| match mode {
+            Mode::Compat => {
+                let expected_extension =
+                    resolve_output_policy(*mode, lossless_format, "mp3").output_extension;
+                needs_regeneration(sf_dict.get(*name), mode, "mp3", expected_extension)
+            }
+            Mode::Lossless => {
+                let source_extension = effective_source_extension(&wf_info.1);
+                let expected_extension =
+                    resolve_output_policy(*mode, lossless_format, &source_extension)
+                        .output_extension;
+
+                needs_regeneration(
+                    sf_dict.get(*name),
+                    mode,
+                    &source_extension,
+                    expected_extension,
+                )
+            }
+        })
+        .collect()
+}
+
+fn needs_regeneration(
+    existing: Option<&(String, PathBuf)>,
+    mode: &Mode,
+    source_extension: &str,
+    expected_extension: &str,
+) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+
+    if existing.0.parse::<u64>().unwrap_or(0) == 0 {
+        return true;
+    }
+
+    let existing_extension = existing
+        .1
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .unwrap_or_default();
+
+    match mode {
+        Mode::Compat => existing_extension != expected_extension,
+        Mode::Lossless if source_extension == "mp3" => false,
+        Mode::Lossless => existing_extension != expected_extension,
+    }
+}
+
+pub fn sync_music_library_with_policy(
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+) -> io::Result<TaskSnapshot> {
+    let task_controller = TaskController::running(new_songs.len());
+    sync_music_library_with_task(
+        new_songs,
+        dest_folder,
+        mode,
+        lossless_format,
+        &task_controller,
+    )
+}
+
+pub fn sync_music_library_with_task(
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    task_controller: &TaskController,
+) -> io::Result<TaskSnapshot> {
+    sync_music_library_with_observer(
+        new_songs,
+        dest_folder,
+        mode,
+        lossless_format,
+        task_controller,
+        |_, _, _| {},
+    )
+}
+
+pub fn sync_music_library_with_observer(
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    task_controller: &TaskController,
+    mut after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
+) -> io::Result<TaskSnapshot> {
+    if new_songs.is_empty() {
+        return Ok(task_controller.snapshot());
+    }
+
+    let bar = indicatif::ProgressBar::new(new_songs.len() as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})\n{msg}",
+        )
+        .unwrap(),
+    );
+
+    let mut queued_files = new_songs.iter().collect::<Vec<_>>();
+    queued_files.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    let mut skipped_files = 0usize;
+    let mut last_error: Option<io::Error> = None;
+
+    for (&name, info) in queued_files {
+        if task_controller.is_cancelled() {
+            bar.abandon_with_message("Sync cancelled.");
+            return Ok(task_controller.snapshot());
+        }
+
+        if !task_controller.should_start_next_file() {
+            bar.abandon_with_message("Sync paused after current file.");
+            return Ok(task_controller.snapshot());
+        }
+
+        let task_result = process_music_file(name, info, dest_folder, mode, lossless_format, &bar);
+        match task_result {
+            Ok(()) => {
+                task_controller.complete_current_file();
+                bar.inc(1);
+                after_file(name, task_controller, None);
+            }
+            Err(err) => {
+                let error_message = err.to_string();
+                skipped_files += 1;
+                last_error = Some(io::Error::new(err.kind(), error_message.clone()));
+                bar.inc(1);
+                after_file(name, task_controller, Some(&err));
+                bar.println(format!("Skipped {}: {}", name, error_message));
+            }
+        }
+    }
+
+    let snapshot = task_controller.snapshot();
+    if snapshot.completed == 0 && skipped_files > 0 {
+        bar.abandon_with_message(format!(
+            "Sync failed after skipping {} files.",
+            skipped_files
+        ));
+        return Err(last_error.unwrap_or_else(|| {
+            io::Error::other(format!(
+                "Sync failed after skipping {} files.",
+                skipped_files
+            ))
+        }));
+    }
+
+    bar.finish_with_message(format!(
+        "Sync processing complete. {}/{} files processed, {} skipped.",
+        snapshot.completed, snapshot.total, skipped_files
+    ));
+    Ok(snapshot)
+}
+
+fn process_music_file(
+    name: &str,
+    info: &(String, PathBuf),
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    bar: &indicatif::ProgressBar,
+) -> io::Result<()> {
+    let src_path = info.1.as_path();
+    if !src_path.exists() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("Source file missing: {}", src_path.display()),
+        ));
+    }
+    let extension = src_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match extension.as_str() {
+        "mp3" => {
+            bar.set_message(format!("Copying MP3: {}", name));
+            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
+            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
+            let result = match output_policy.target_profile {
+                TargetProfile::CompatMp3 => copy_file(src_path, &output_path),
+                _ => convert_audio_to_target_format(
+                    src_path,
+                    &output_path,
+                    output_policy.target_profile,
+                    name,
+                ),
+            };
+
+            if result.is_ok() {
+                if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
+                    strip_163_key_from_mp3(&output_path)?;
+                }
+                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+            }
+
+            result
+        }
+        "wav" | "aiff" => {
+            bar.set_message(format!("Processing {}: {}", extension.to_uppercase(), name));
+            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
+            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
+            let result = match output_policy.target_profile {
+                TargetProfile::CompatMp3
+                | TargetProfile::LosslessWav
+                | TargetProfile::LosslessAiff => convert_audio_to_target_format(
+                    src_path,
+                    &output_path,
+                    output_policy.target_profile,
+                    name,
+                ),
+            };
+
+            if result.is_ok() {
+                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+            }
+
+            result
+        }
+        "flac" => {
+            bar.set_message(format!("Processing FLAC: {}", name));
+            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
+            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
+            let result = match mode {
+                Mode::Lossless => convert_audio_to_target_format(
+                    src_path,
+                    &output_path,
+                    output_policy.target_profile,
+                    name,
+                ),
+                Mode::Compat => convert_flac_to_mp3(src_path, dest_folder, name),
+            };
+
+            if result.is_ok() {
+                if matches!(
+                    output_policy.target_profile,
+                    TargetProfile::LosslessWav | TargetProfile::LosslessAiff
+                ) {
+                    write_container_tags_from_flac_source(
+                        src_path,
+                        &output_path,
+                        output_policy.target_profile,
+                    )?;
+                }
+                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+            }
+
+            result
+        }
+        _ => unreachable!(
+            "Invalid file extension '{}' for song '{}'. Filter failed.",
+            extension, name
+        ),
+    }
+}
+
+fn copy_file(src_path: &Path, dest_path: &Path) -> io::Result<()> {
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src_path, dest_path).map(|_| ()).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "Failed to copy {} to {}: {}",
+                src_path.display(),
+                dest_path.display(),
+                error
+            ),
+        )
+    })
+}
+
+fn convert_flac_to_mp3(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<()> {
+    let output_path = target_output_path(dest_folder, name_stem, "mp3");
+    convert_audio_to_target_format(src_path, &output_path, TargetProfile::CompatMp3, name_stem)
+}
+
+fn convert_audio_to_target_format(
+    src_path: &Path,
+    output_path: &Path,
+    target_profile: TargetProfile,
+    name_stem: &str,
+) -> io::Result<()> {
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| {
+        Error::new(
+            ErrorKind::NotFound,
+            "FFmpeg not found. Put the sidecar next to the app, in a binaries/ folder, set W4DJ_FFMPEG_PATH, or install FFmpeg in PATH.",
+        )
+    })?;
+
+    let mut command = Command::new(&ffmpeg_path);
+    configure_background_process(&mut command);
+    command
+        .arg("-y")
+        .arg("-i")
+        .arg(src_path)
+        .arg("-loglevel")
+        .arg("quiet")
+        .arg("-map_metadata")
+        .arg("0");
+
+    match target_profile {
+        TargetProfile::CompatMp3 => {
+            command.arg("-q:a").arg("0").arg("-id3v2_version").arg("3");
+        }
+        TargetProfile::LosslessWav => {
+            command.arg("-c:a").arg("pcm_s24le");
+        }
+        TargetProfile::LosslessAiff => {
+            command.arg("-c:a").arg("pcm_s24be");
+        }
+    }
+
+    let status = command.arg(output_path).status().map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!("Failed to start FFmpeg at {}: {}", ffmpeg_path, error),
+        )
+    })?;
+
+    if !status.success() {
+        return Err(Error::other(format!(
+            "FFmpeg conversion failed for {}",
+            name_stem
+        )));
+    }
+
+    ensure_generated_output(output_path, name_stem)
+}
+
+fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()> {
+    let metadata = fs::metadata(output_path).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "FFmpeg reported success for {}, but output {} is unavailable: {}",
+                name_stem,
+                output_path.display(),
+                error
+            ),
+        )
+    })?;
+
+    if metadata.len() == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "FFmpeg produced an empty output for {}: {}",
+                name_stem,
+                output_path.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn configure_background_process(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_background_process(_command: &mut Command) {}
+
+fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str) -> PathBuf {
+    Path::new(dest_folder).join(format!(
+        "{}.{}",
+        sanitize_filename_component(name_stem),
+        output_extension
+    ))
+}
+
+fn effective_source_extension(source_path: &Path) -> String {
+    let path = source_path;
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    extension
+}
+
+fn remove_conflicting_outputs(
+    dest_folder: &str,
+    name_stem: &str,
+    keep_extension: &str,
+) -> io::Result<()> {
+    for extension in ["mp3", "flac", "wav", "aiff"] {
+        if extension == keep_extension {
+            continue;
+        }
+
+        let candidate_path = target_output_path(dest_folder, name_stem, extension);
+        if candidate_path.exists() {
+            fs::remove_file(candidate_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
+    let mut tag = match id3::Tag::read_from_path(path) {
+        Ok(tag) => tag,
+        Err(error) if error.to_string().contains("NoTag") => return Ok(()),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    let comments_to_remove = tag
+        .comments()
+        .filter(|comment| comment.text.starts_with("163 key(") || comment.description == "163 key")
+        .map(|comment| {
+            (
+                comment.lang.clone(),
+                comment.description.clone(),
+                comment.text.clone(),
+            )
+        })
+        .collect::<Vec<(String, String, String)>>();
+
+    for (_, description, text) in comments_to_remove {
+        tag.remove_comment(Some(&description), Some(&text));
+    }
+
+    tag.remove_extended_text(Some("163 key"), None);
+    tag.write_to_path(path, Version::Id3v24)
+        .map_err(io::Error::other)
+}
+
+fn derive_song_name(path: &Path) -> String {
+    let fallback_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let candidate = match extension.as_str() {
+        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path),
+        "flac" => song_name_from_flac(path),
+        _ => None,
+    };
+
+    candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name))
+}
+
+fn song_name_from_flac(path: &Path) -> Option<String> {
+    let tag = metaflac::Tag::read_from_path(path).ok()?;
+    let id3_tag = build_id3_tag_from_flac(&tag);
+    build_song_name(
+        id3_tag.title().unwrap_or_default(),
+        id3_tag.artist().unwrap_or_default(),
+    )
+}
+
+fn song_name_from_audio_tag(path: &Path) -> Option<String> {
+    let tag = id3::Tag::read_from_path(path).ok()?;
+    build_song_name(
+        tag.title().unwrap_or_default(),
+        tag.artist().unwrap_or_default(),
+    )
+}
+
+fn build_song_name(title: &str, artist: &str) -> Option<String> {
+    let title = sanitize_filename_component(&normalize_display_text(title));
+    let artist = sanitize_filename_component(&normalize_display_text(artist));
+
+    match (title.is_empty(), artist.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(title),
+        (true, false) => Some(artist),
+        (false, false) => Some(format!("{} - {}", title, artist)),
+    }
+}
+
+fn normalize_fallback_song_name(fallback_name: &str) -> String {
+    let display = normalize_display_text(fallback_name);
+
+    if looks_like_soundcloud_text(fallback_name)
+        && let Some((artist, title)) = display.split_once(" - ")
+    {
+        let reordered = build_song_name(title, artist);
+        if let Some(song_name) = reordered {
+            return song_name;
+        }
+    }
+
+    display
+}
+
+fn normalize_display_text(value: &str) -> String {
+    let mut text = value.trim().to_string();
+    if text.is_empty() {
+        return text;
+    }
+
+    let aggressive_soundcloud_cleanup = looks_like_soundcloud_text(&text);
+    text = normalize_unicode_punctuation(&text);
+    text = text.replace('_', " ");
+    text = text.replace('/', ", ");
+    text = strip_promotional_suffixes(&text);
+    if aggressive_soundcloud_cleanup {
+        text = strip_common_trailing_tokens(&text);
+    }
+    text = normalize_collaboration_markers(&text);
+    text = normalize_spacing_around_punctuation(&text);
+
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn looks_like_soundcloud_text(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    lowered.contains('_')
+        || lowered.contains("free_dl")
+        || lowered.contains("freedl")
+        || lowered.contains("soundcloud")
+        || lowered.contains("unreleased")
+        || lowered.contains("id_id")
+        || lowered.ends_with(" id")
+        || lowered.ends_with(" free")
+        || lowered.ends_with(" dl")
+        || lowered.ends_with(" remix")
+}
+
+fn normalize_unicode_punctuation(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '，' => ',',
+            '。' => '.',
+            '：' => ':',
+            '；' => ';',
+            '！' => '!',
+            '？' => '?',
+            '（' => '(',
+            '）' => ')',
+            '【' => '[',
+            '】' => ']',
+            '《' => '<',
+            '》' => '>',
+            '“' | '”' => '"',
+            '‘' | '’' => '\'',
+            '／' | '∕' => '/',
+            '—' | '–' | '－' => '-',
+            '·' => '·',
+            other => other,
+        })
+        .collect()
+}
+
+fn strip_promotional_suffixes(value: &str) -> String {
+    let mut text = value.trim().to_string();
+
+    loop {
+        let Some((open, close)) = trailing_bracket_pair(&text) else {
+            break;
+        };
+
+        let Some((start, inner)) = extract_trailing_bracket_content(&text, open, close) else {
+            break;
+        };
+
+        if is_promotional_suffix(inner) {
+            text.truncate(start);
+            text = text
+                .trim_end_matches(&[' ', '-', '_', '|', '~', '/', '·'][..])
+                .to_string();
+            continue;
+        }
+
+        break;
+    }
+
+    text
+}
+
+fn strip_common_trailing_tokens(value: &str) -> String {
+    let mut text = value.trim().to_string();
+
+    loop {
+        let Some(last_token) = text.split_whitespace().last() else {
+            break;
+        };
+
+        let normalized = last_token
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '.' | ','
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '\''
+                        | '"'
+                )
+            })
+            .to_lowercase();
+
+        let is_year = normalized.len() == 4
+            && (normalized.starts_with("19") || normalized.starts_with("20"))
+            && normalized.chars().all(|ch| ch.is_ascii_digit());
+
+        let should_strip = matches!(
+            normalized.as_str(),
+            "id" | "unreleased"
+                | "free"
+                | "dl"
+                | "freedl"
+                | "free_dl"
+                | "soundcloud"
+                | "preview"
+                | "snippet"
+                | "teaser"
+                | "promo"
+                | "promotion"
+                | "official"
+                | "audio"
+                | "video"
+                | "live"
+        ) || is_year;
+
+        if !should_strip {
+            break;
+        }
+
+        let new_len = text
+            .rsplit_once(last_token)
+            .map(|(prefix, _)| prefix.trim_end().len())
+            .unwrap_or(0);
+        text.truncate(new_len);
+        text = text
+            .trim_end_matches(&[' ', '-', '_', '|', '~', '/', '·', '.', ',', ';', ':'][..])
+            .to_string();
+    }
+
+    text
+}
+
+fn trailing_bracket_pair(text: &str) -> Option<(char, char)> {
+    let trimmed = text.trim_end();
+    let close = trimmed.chars().last()?;
+    let open = match close {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        '>' => '<',
+        _ => return None,
+    };
+
+    Some((open, close))
+}
+
+fn extract_trailing_bracket_content(text: &str, open: char, close: char) -> Option<(usize, &str)> {
+    let trimmed = text.trim_end();
+    let close_index = trimmed.char_indices().rev().find(|(_, ch)| *ch == close)?.0;
+    let prefix = &trimmed[..close_index];
+    let open_index = prefix.char_indices().rev().find(|(_, ch)| *ch == open)?.0;
+    let inner = &trimmed[open_index + open.len_utf8()..close_index];
+    Some((open_index, inner.trim()))
+}
+
+fn is_promotional_suffix(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    let compact = lowered.split_whitespace().collect::<String>();
+
+    let keywords = [
+        "officialaudio",
+        "officialvideo",
+        "officialmusicvideo",
+        "musicvideo",
+        "lyricvideo",
+        "lyricsvideo",
+        "lyrics",
+        "lyric",
+        "audio",
+        "video",
+        "visualizer",
+        "visualiser",
+        "mv",
+        "m/v",
+        "performancevideo",
+        "live",
+        "liveaudio",
+        "clean",
+        "explicit",
+        "promo",
+        "promotion",
+        "trailer",
+        "snippet",
+        "teaser",
+        "preview",
+        "remaster",
+        "remastered",
+        "edit",
+        "radioedit",
+        "clubedit",
+        "extendedmix",
+        "instrumental",
+        "karaoke",
+        "specialedition",
+        "singleversion",
+        "soundcloud",
+        "网易云音乐",
+        "网易云",
+        "free_dl",
+        "freedl",
+    ];
+
+    keywords.iter().any(|keyword| compact.contains(keyword))
+}
+
+fn normalize_collaboration_markers(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|token| {
+            let trimmed = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            });
+            let lowered = trimmed.to_lowercase();
+
+            match trimmed {
+                "×" => String::from("feat."),
+                _ if matches!(lowered.as_str(), "feat" | "ft" | "featuring" | "with" | "x") => {
+                    String::from("feat.")
+                }
+                _ => token.to_string(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn normalize_spacing_around_punctuation(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut prev_was_space = false;
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        let normalized = match ch {
+            ',' | ':' | ';' | '!' | '?' => ch,
+            '.' => ch,
+            '(' | '[' | '{' => ch,
+            ')' | ']' | '}' => ch,
+            '/' => '/',
+            _ => ch,
+        };
+
+        if normalized.is_whitespace() {
+            if !prev_was_space {
+                output.push(' ');
+                prev_was_space = true;
+            }
+            continue;
+        }
+
+        if matches!(normalized, ',' | ':' | ';' | '!' | '?' | '.') {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push(normalized);
+            if chars.peek().is_some_and(|next| {
+                !next.is_whitespace()
+                    && !matches!(next, ',' | ':' | ';' | '!' | '?' | '.' | ')' | ']' | '}')
+            }) {
+                output.push(' ');
+                prev_was_space = true;
+            } else {
+                prev_was_space = false;
+            }
+            continue;
+        }
+
+        if matches!(normalized, ')' | ']' | '}') {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push(normalized);
+            prev_was_space = false;
+            continue;
+        }
+
+        if matches!(normalized, '(' | '[' | '{') {
+            if !output.is_empty() && !output.ends_with(' ') {
+                output.push(' ');
+            }
+            output.push(normalized);
+            prev_was_space = false;
+            continue;
+        }
+
+        output.push(normalized);
+        prev_was_space = false;
+    }
+
+    output
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    trimmed
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            control if control.is_control() => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+fn write_container_tags_from_flac_source(
+    source_path: &Path,
+    output_path: &Path,
+    target_profile: TargetProfile,
+) -> io::Result<()> {
+    let tag = metaflac::Tag::read_from_path(source_path).map_err(io::Error::other)?;
+    let id3_tag = build_id3_tag_from_flac(&tag);
+
+    #[allow(deprecated)]
+    match target_profile {
+        TargetProfile::LosslessWav => id3_tag
+            .write_to_wav_path(output_path, Version::Id3v24)
+            .map_err(io::Error::other),
+        TargetProfile::LosslessAiff => id3_tag
+            .write_to_aiff_path(output_path, Version::Id3v24)
+            .map_err(io::Error::other),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_song_name, compare_music_dicts, derive_song_name, ensure_generated_output,
+        find_ffmpeg_next_to_exe, sanitize_filename_component,
+    };
+    use crate::config::{LosslessFormat, Mode};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn write_executable_file(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[test]
+    fn sanitizes_invalid_filename_characters() {
+        assert_eq!(sanitize_filename_component("A/B:C*D?"), "A-B-C-D-");
+    }
+
+    #[test]
+    fn combines_title_and_artist_with_separator() {
+        assert_eq!(
+            build_song_name("paper hearts", "CLV Edit").as_deref(),
+            Some("paper hearts - CLV Edit")
+        );
+    }
+
+    #[test]
+    fn strips_promotional_parenthetical_suffixes() {
+        assert_eq!(
+            build_song_name("Paper Hearts (Official Video)", "CLV Edit").as_deref(),
+            Some("Paper Hearts - CLV Edit")
+        );
+    }
+
+    #[test]
+    fn normalizes_collaboration_markers_and_spacing() {
+        assert_eq!(
+            build_song_name("Paper Hearts ft. CLV", "A／B").as_deref(),
+            Some("Paper Hearts feat. CLV - A, B")
+        );
+    }
+
+    #[test]
+    fn converts_with_and_unicode_punctuation_to_standard_form() {
+        assert_eq!(
+            build_song_name("Paper Hearts with CLV，Live", "Artist").as_deref(),
+            Some("Paper Hearts feat. CLV, Live - Artist")
+        );
+    }
+
+    #[test]
+    fn normalizes_x_and_times_sign_collaboration_markers() {
+        assert_eq!(
+            build_song_name("Paper Hearts x CLV × Artist", "DJ").as_deref(),
+            Some("Paper Hearts feat. CLV feat. Artist - DJ")
+        );
+    }
+
+    #[test]
+    fn preserves_regular_years_in_non_soundcloud_titles() {
+        assert_eq!(
+            build_song_name("Song 2023", "Artist").as_deref(),
+            Some("Song 2023 - Artist")
+        );
+    }
+
+    #[test]
+    fn normalizes_soundcloud_style_filename_fallbacks() {
+        assert_eq!(
+            derive_song_name(std::path::Path::new(
+                "/tmp/Knock2_ISOxo_Travis_Scott_Yeat_-_Smack_Talk_x_Fein_x_Breathe_Mantra_Edit_FREE_DL.mp3"
+            )),
+            "Smack Talk feat. Fein feat. Breathe Mantra Edit - Knock2 ISOxo Travis Scott Yeat"
+        );
+    }
+
+    #[test]
+    fn strips_soundcloud_trailing_noise_from_filename_fallbacks() {
+        assert_eq!(
+            derive_song_name(std::path::Path::new(
+                "/tmp/Skrillex_ft_ISOxo_Zeina_Logan_olm_-_Take_It_All_Whisper_ID_ID_2023_unreleased.mp3"
+            )),
+            "Take It All Whisper - Skrillex feat. ISOxo Zeina Logan olm"
+        );
+    }
+
+    #[test]
+    fn compare_music_dicts_skips_existing_lossless_output_without_using_source_size() {
+        let mut source = HashMap::new();
+        source.insert(
+            "Song".to_string(),
+            ("100".to_string(), PathBuf::from("/music/source/Song.flac")),
+        );
+
+        let mut destination = HashMap::new();
+        destination.insert(
+            "Song".to_string(),
+            ("4096".to_string(), PathBuf::from("/music/dest/Song.wav")),
+        );
+
+        let diff = compare_music_dicts(
+            &source,
+            &destination,
+            &Mode::Lossless,
+            Some(LosslessFormat::Wav),
+        );
+
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn compare_music_dicts_reprocesses_zero_byte_existing_output() {
+        let mut source = HashMap::new();
+        source.insert(
+            "Song".to_string(),
+            ("100".to_string(), PathBuf::from("/music/source/Song.mp3")),
+        );
+
+        let mut destination = HashMap::new();
+        destination.insert(
+            "Song".to_string(),
+            ("0".to_string(), PathBuf::from("/music/dest/Song.mp3")),
+        );
+
+        let diff = compare_music_dicts(&source, &destination, &Mode::Compat, None);
+
+        assert_eq!(diff.len(), 1);
+    }
+
+    #[test]
+    fn finds_platform_specific_ffmpeg_sidecar_next_to_executable() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj.exe");
+        let sidecar_path = dir.path().join("ffmpeg-x86_64-pc-windows-msvc.exe");
+
+        fs::write(&exe_path, []).unwrap();
+        write_executable_file(&sidecar_path, b"ffmpeg sidecar");
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+        assert_eq!(found, sidecar_path);
+    }
+
+    #[test]
+    fn finds_ffmpeg_sidecar_inside_binaries_directory() {
+        let dir = tempdir().unwrap();
+        let exe_dir = dir.path();
+        let exe_path = exe_dir.join("w4dj.exe");
+        let binaries_dir = exe_dir.join("binaries");
+        let sidecar_path = binaries_dir.join("ffmpeg-aarch64-apple-darwin");
+
+        fs::create_dir_all(&binaries_dir).unwrap();
+        fs::write(&exe_path, []).unwrap();
+        write_executable_file(&sidecar_path, b"ffmpeg sidecar");
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+        assert_eq!(found, sidecar_path);
+    }
+
+    #[test]
+    fn prefers_arch_specific_ffmpeg_sidecar_when_multiple_exist() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj.exe");
+        let binaries_dir = dir.path().join("binaries");
+        let preferred_windows = binaries_dir.join("ffmpeg-x86_64-pc-windows-msvc.exe");
+        let preferred_macos = binaries_dir.join("ffmpeg-aarch64-apple-darwin");
+
+        fs::create_dir_all(&binaries_dir).unwrap();
+        fs::write(&exe_path, []).unwrap();
+        write_executable_file(&preferred_windows, b"ffmpeg windows sidecar");
+        write_executable_file(&preferred_macos, b"ffmpeg mac sidecar");
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(found, preferred_windows);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(found, preferred_macos);
+    }
+
+    #[test]
+    fn does_not_treat_desktop_executable_as_ffmpeg_sidecar() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj-desktop");
+
+        write_executable_file(&exe_path, b"desktop executable");
+
+        assert!(find_ffmpeg_next_to_exe(&exe_path).is_none());
+    }
+
+    #[test]
+    fn rejects_successful_conversion_without_an_output_file() {
+        let dir = tempdir().unwrap();
+        let missing_output = dir.path().join("missing.aiff");
+
+        let error = ensure_generated_output(&missing_output, "Missing Song").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("missing.aiff"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn skips_placeholder_ffmpeg_sidecars() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj");
+        let placeholder = dir.path().join("ffmpeg-aarch64-apple-darwin");
+        let fallback = dir.path().join("ffmpeg");
+
+        fs::write(&exe_path, []).unwrap();
+        fs::write(&placeholder, b"local cargo-check placeholder\n").unwrap();
+        write_executable_file(&fallback, b"real ffmpeg binary");
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+
+        assert_eq!(found, fallback);
+    }
+}
