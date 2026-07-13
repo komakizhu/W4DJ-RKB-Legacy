@@ -26,7 +26,7 @@ pub struct Config {
 #[derive(clap::Parser)]
 #[command(
     name = "w4dj-rkb-legacy",
-    version = "1.0.0",
+    version = "2.0.1",
     author = "slipstream",
     about = "DJ 音乐库同步器（不含 NCM 解密）"
 )]

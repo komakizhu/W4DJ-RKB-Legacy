@@ -3961,7 +3961,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-rkb-legacy"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-rkb-legacy-desktop"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "libc",
  "serde",
